@@ -476,6 +476,10 @@ sub config {
         push @$cmd, '-object',
             'memory-backend-memfd,id=virtiofs-mem' . ",size=$conf->{memory}M,share=on";
         push @$machine_flags, 'memory-backend=virtiofs-mem';
+    } elsif (has_vpp_bridge($conf)) {
+        push @$cmd, '-object',
+            'memory-backend-memfd,id=vpp-mem' . ",size=$conf->{memory}M,share=on";
+        push @$machine_flags, 'memory-backend=vpp-mem';
     }
 
     if ($hotplug) {
@@ -499,6 +503,16 @@ sub config {
     }
 }
 
+sub has_vpp_bridge {
+    my ($conf) = @_;
+    for my $opt (keys %$conf) {
+        next if $opt !~ m/^net\d+$/;
+        my $net = PVE::QemuServer::Network::parse_net($conf->{$opt});
+        return 1 if $net && $net->{bridge} && $net->{bridge} =~ /^vppbr\d+$/;
+    }
+    return 0;
+}
+
 sub print_mem_object {
     my ($conf, $id, $size) = @_;
 
@@ -508,7 +522,7 @@ sub print_mem_object {
         my $path = hugepages_mount_path($hugepages_size);
 
         return "memory-backend-file,id=$id,size=${size}M,mem-path=$path,share=on,prealloc=yes";
-    } elsif ($id =~ m/^virtiofs-mem/) {
+    } elsif ($id =~ m/^(?:virtiofs|vpp)-mem/) {
         return "memory-backend-memfd,id=$id,size=${size}M,share=on";
     } else {
         return "memory-backend-ram,id=$id,size=${size}M";

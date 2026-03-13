@@ -95,7 +95,6 @@ use PVE::QemuServer::RunState;
 use PVE::QemuServer::StateFile;
 use PVE::QemuServer::USB;
 use PVE::QemuServer::Virtiofs qw(max_virtiofs start_all_virtiofsd);
-use PVE::QemuServer::VolumeChain;
 use PVE::QemuServer::DBusVMState;
 
 my $have_ha_config;
@@ -316,8 +315,7 @@ my $confdesc = {
         optional => 1,
         type => 'integer',
         description =>
-            "Amount of target RAM for the VM in MiB. The balloon driver is enabled by default,"
-            . " unless it is explicitly disabled by setting the value to zero.",
+            "Amount of target RAM for the VM in MiB. Using zero disables the ballon driver.",
         minimum => 0,
     },
     shares => {
@@ -639,7 +637,12 @@ EODESCR
             . ' This is used internally for snapshots.',
     },
     machine => get_standard_option('pve-qemu-machine'),
-    arch => get_standard_option('pve-qm-cpu-arch', { optional => 1 }),
+    arch => {
+        description => "Virtual processor architecture. Defaults to the host.",
+        optional => 1,
+        type => 'string',
+        enum => [qw(x86_64 aarch64)],
+    },
     smbios1 => {
         description => "Specify SMBIOS type 1 fields.",
         type => 'string',
@@ -1442,7 +1445,10 @@ sub print_netdev_full {
     my $netdev = "";
     my $script = $hotplug ? "pve-bridge-hotplug" : "pve-bridge";
 
-    if ($net->{bridge}) {
+    if ($net->{bridge} && $net->{bridge} =~ /^vppbr\d+$/) {
+        # VPP bridge: use vhost-user socket instead of tap
+        $netdev = "type=vhost-user,id=$netid,chardev=vhost-user-${netid}";
+    } elsif ($net->{bridge}) {
         $netdev = "type=tap,id=$netid,ifname=${ifname},script=/usr/libexec/qemu-server/$script"
             . ",downscript=/usr/libexec/qemu-server/pve-bridgedown$vhostparam";
     } else {
@@ -2586,8 +2592,7 @@ sub vmstatus {
         $d->{uptime} = int(($uptime - $pstat->{starttime}) / $cpuinfo->{user_hz});
 
         my $cgroup = PVE::QemuServer::CGroup->new($vmid);
-        my $cgroup_mem = eval { $cgroup->get_memory_stat() } // {};
-        warn "unable to get memory stat for $vmid - $@" if $@;
+        my $cgroup_mem = $cgroup->get_memory_stat();
         $d->{memhost} = $cgroup_mem->{mem} // 0;
 
         $d->{mem} = $d->{memhost}; # default to cgroup, balloon info can override this below
@@ -2713,7 +2718,7 @@ sub vmstatus {
         $qmpclient->queue_cmd($qmp_peer, $blockstatscb, 'query-blockstats');
         $qmpclient->queue_cmd($qmp_peer, $machinecb, 'query-machines');
         $qmpclient->queue_cmd($qmp_peer, $versioncb, 'query-version');
-        # this fails if balloon driver is not loaded, so this must be
+        # this fails if ballon driver is not loaded, so this must be
         # the last command (following command are aborted if this fails).
         $qmpclient->queue_cmd($qmp_peer, $ballooncb, 'query-balloon');
 
@@ -2936,13 +2941,17 @@ sub vga_conf_has_spice {
 sub query_supported_cpu_flags {
     my ($arch) = @_;
 
-    my $host_arch = get_host_arch();
-    $arch //= $host_arch;
+    $arch //= get_host_arch();
     my $default_machine = PVE::QemuServer::Machine::default_machine_for_arch($arch);
 
     my $flags = {};
 
-    my $kvm_supported = defined(kvm_version()) && $arch eq $host_arch;
+    # FIXME: Once this is merged, the code below should work for ARM as well:
+    # https://lists.nongnu.org/archive/html/qemu-devel/2019-06/msg04947.html
+    die "QEMU/KVM cannot detect CPU flags on ARM (aarch64)\n"
+        if $arch eq "aarch64";
+
+    my $kvm_supported = defined(kvm_version());
     my $qemu_cmd = PVE::QemuServer::Helpers::get_command_for_arch($arch);
     my $fakevmid = -1;
     my $pidfile = PVE::QemuServer::Helpers::vm_pidfile_name($fakevmid);
@@ -2970,8 +2979,6 @@ sub query_supported_cpu_flags {
 
         if (!$kvm) {
             push @$cmd, '-accel', 'tcg';
-        } else {
-            push @$cmd, '-cpu', 'host';
         }
 
         my $rc = run_command($cmd, noerr => 1, quiet => 0);
@@ -2982,7 +2989,7 @@ sub query_supported_cpu_flags {
                 $fakevmid,
                 'query-cpu-model-expansion',
                 type => 'full',
-                model => { name => $kvm ? 'host' : 'max' },
+                model => { name => 'host' },
             );
 
             my $props = $cmd_result->{model}->{props};
@@ -3125,7 +3132,7 @@ sub config_to_command {
         die "Detected old QEMU binary ('$kvmver', at least 6.0 is required)\n";
     }
 
-    my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf, $forcemachine);
+    my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf, $forcemachine, $arch);
     my $machine_version = extract_version($machine_type, $kvmver);
     $kvm //= 1 if is_native_arch($arch);
 
@@ -3661,6 +3668,11 @@ sub config_to_command {
         $d->{bootindex} = $bootorder->{$netname} if $bootorder->{$netname};
 
         my $netdevfull = print_netdev_full($vmid, $conf, $arch, $d, $netname);
+        if ($d->{bridge} && $d->{bridge} =~ /^vppbr\d+$/) {
+            my $socket = "/var/run/vpp/qemu-${vmid}-${netname}.sock";
+            push @$devices, '-chardev',
+                "socket,id=vhost-user-${netname},path=${socket}";
+        }
         push @$devices, '-netdev', $netdevfull;
 
         # force +pve1 if machine version 10.0, for host_mtu differentiation
@@ -3730,7 +3742,7 @@ sub config_to_command {
         push @$machineFlags, 'accel=tcg';
     }
     my $power_state_flags =
-        PVE::QemuServer::Machine::get_power_state_flags($machine_conf, $arch, $version_guard);
+        PVE::QemuServer::Machine::get_power_state_flags($machine_conf, $version_guard);
     push $cmd->@*, $power_state_flags->@* if defined($power_state_flags);
 
     push @$machineFlags, 'smm=off' if should_disable_smm($conf, $vga, $machine_type);
@@ -4129,7 +4141,7 @@ sub qemu_devicedelverify {
         sleep 1;
     }
 
-    die "error on hot-unplugging device '$deviceid' - still busy in guest?\n";
+    die "error on hot-unplugging device '$deviceid'\n";
 }
 
 sub qemu_findorcreatescsihw {
@@ -4217,6 +4229,29 @@ sub qemu_netdevadd {
     my ($vmid, $conf, $arch, $device, $deviceid) = @_;
 
     my $netdev = print_netdev_full($vmid, $conf, $arch, $device, $deviceid, 1);
+
+    # For VPP bridges, add chardev first then netdev via QMP
+    if ($device->{bridge} && $device->{bridge} =~ /^vppbr\d+$/) {
+        my $socket = "/var/run/vpp/qemu-${vmid}-${deviceid}.sock";
+        mon_cmd(
+            $vmid, "chardev-add",
+            id   => "vhost-user-${deviceid}",
+            backend => {
+                type => 'socket',
+                data => {
+                    addr    => { type => 'unix', data => { path => $socket } },
+                    server  => JSON::true,
+                    wait    => JSON::false,
+                },
+            },
+        );
+        my %options = split(/[=,]/, $netdev);
+        mon_cmd($vmid, "netdev_add", %options);
+        # Connect VPP side
+        vpp_connect_vhost_nets($conf, $vmid);
+        return 1;
+    }
+
     my %options = split(/[=,]/, $netdev);
 
     if (defined(my $vhost = $options{vhost})) {
@@ -4356,7 +4391,7 @@ sub qemu_volume_snapshot {
         print "external qemu snapshot\n";
         my $snapshots = PVE::Storage::volume_snapshot_info($storecfg, $volid);
         my $parent_snap = $snapshots->{'current'}->{parent};
-        PVE::QemuServer::VolumeChain::blockdev_external_snapshot(
+        PVE::QemuServer::Blockdev::blockdev_external_snapshot(
             $storecfg, $vmid, $machine_version, $deviceid, $drive, $snap, $parent_snap,
         );
     } elsif ($do_snapshots_type eq 'storage') {
@@ -4414,7 +4449,7 @@ sub qemu_volume_snapshot_delete {
         # improve-me: if firstsnap > child : commit, if firstsnap < child do a stream.
         if (!$parentsnap) {
             print "delete first snapshot $snap\n";
-            PVE::QemuServer::VolumeChain::blockdev_commit(
+            PVE::QemuServer::Blockdev::blockdev_commit(
                 $storecfg,
                 $vmid,
                 $machine_version,
@@ -4426,7 +4461,7 @@ sub qemu_volume_snapshot_delete {
 
             PVE::Storage::rename_snapshot($storecfg, $volid, $snap, $childsnap);
 
-            PVE::QemuServer::VolumeChain::blockdev_replace(
+            PVE::QemuServer::Blockdev::blockdev_replace(
                 $storecfg,
                 $vmid,
                 $machine_version,
@@ -4439,7 +4474,7 @@ sub qemu_volume_snapshot_delete {
         } else {
             #intermediate snapshot, we always stream the snapshot to child snapshot
             print "stream intermediate snapshot $snap to $childsnap\n";
-            PVE::QemuServer::VolumeChain::blockdev_stream(
+            PVE::QemuServer::Blockdev::blockdev_stream(
                 $storecfg,
                 $vmid,
                 $machine_version,
@@ -4556,7 +4591,7 @@ sub vmconfig_hotplug_pending {
 
     my $defaults = load_defaults();
     my $arch = PVE::QemuServer::Helpers::get_vm_arch($conf);
-    my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf);
+    my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf, undef, $arch);
 
     # commit values which do not have any impact on running VM first
     # Note: those option cannot raise errors, we we do not care about
@@ -4759,7 +4794,7 @@ sub vmconfig_hotplug_pending {
                 die "skip\n" if !$hotplug_features->{cpu};
                 qemu_cpu_hotplug($vmid, $conf, $value);
             } elsif ($opt eq 'balloon') {
-                # enable/disable ballooning device is not hotpluggable
+                # enable/disable balloning device is not hotpluggable
                 my $old_balloon_enabled = !!(!defined($conf->{balloon}) || $conf->{balloon});
                 my $new_balloon_enabled =
                     !!(!defined($conf->{pending}->{balloon}) || $conf->{pending}->{balloon});
@@ -4971,7 +5006,6 @@ sub vmconfig_apply_pending {
                         $old_drive,
                         $new_drive,
                     );
-                    $conf->{pending}->{$opt} = print_drive($new_drive);
                 }
             } elsif (defined($conf->{pending}->{$opt}) && $opt =~ m/^net\d+$/) {
                 my $new_net = PVE::QemuServer::Network::parse_net($conf->{pending}->{$opt});
@@ -5135,6 +5169,49 @@ sub vmconfig_update_net {
         vm_deviceplug($storecfg, $conf, $vmid, $opt, $newnet, $arch, $machine_type);
     } else {
         die "skip\n";
+    }
+}
+
+sub vpp_connect_vhost_nets {
+    my ($conf, $vmid) = @_;
+
+    return if !-x '/usr/bin/vppctl';
+
+    foreach my $opt (keys %$conf) {
+        next if $opt !~ m/^net(\d+)$/;
+        my $net = PVE::QemuServer::Network::parse_net($conf->{$opt});
+        next if !$net || !$net->{bridge} || $net->{bridge} !~ /^vppbr(\d+)$/;
+
+        my $bd_id  = $1;
+        my $socket = "/var/run/vpp/qemu-${vmid}-${opt}.sock";
+
+        eval {
+            my $iface_name = '';
+            PVE::Tools::run_command(
+                [
+                    '/usr/bin/vppctl', 'create', 'vhost-user',
+                    'socket', $socket, 'server',
+                ],
+                outfunc => sub { $iface_name .= $_[0]; },
+                timeout => 10,
+            );
+            $iface_name =~ s/^\s+|\s+$//g;
+            die "vppctl did not return interface name\n" if !$iface_name;
+
+            PVE::Tools::run_command(
+                ['/usr/bin/vppctl', 'set', 'interface', 'state', $iface_name, 'up'],
+                timeout => 5,
+            );
+            PVE::Tools::run_command(
+                [
+                    '/usr/bin/vppctl', 'set', 'interface', 'l2', 'bridge',
+                    $iface_name, $bd_id,
+                ],
+                timeout => 5,
+            );
+            print "VPP: connected $iface_name to bridge-domain $bd_id via $socket\n";
+        };
+        warn "VPP vhost-user setup failed for $opt: $@" if $@;
     }
 }
 
@@ -5402,18 +5479,16 @@ my sub check_efi_vars {
 
     return if PVE::QemuConfig->is_template($conf);
     return if !$conf->{efidisk0};
+    return if !$conf->{ostype};
+    return if $conf->{ostype} ne 'win10' && $conf->{ostype} ne 'win11';
 
     my $efidisk = parse_drive('efidisk0', $conf->{efidisk0});
     if (PVE::QemuServer::OVMF::should_enroll_ms_2023_cert($efidisk)) {
         # TODO: make the first print a log_warn with PVE 9.2 to make it more noticeable!
-        print "EFI disk without 'ms-cert=2023k' option, suggesting that not all UEFI 2023\n";
-        print "certificates from Microsoft are enrolled yet. The UEFI 2011 certificates expire\n";
-        print
-            "in June 2026! The new certificates are required for secure boot update for Windows\n";
-        print "and common Linux distributions. Use 'Disk Action > Enroll Updated Certificates'\n";
-        print "in the UI or, while the VM is shut down, run 'qm enroll-efi-keys $vmid' to enroll\n";
-        print "the new certificates.\n\n";
-        print "For Windows with BitLocker, run the following command inside Powershell:\n";
+        print "EFI disk without 'ms-cert=2023w' option, suggesting that the Microsoft UEFI 2023"
+            . " certificate is not enrolled yet. The UEFI 2011 certificate expires in June 2026!\n";
+        print "While the VM is shut down, run 'qm enroll-efi-keys $vmid' to enroll it.\n";
+        print "If the VM uses BitLocker, run the following command inside Windows Powershell:\n";
         print "  manage-bde -protectors -disable <drive>\n";
         print "for each drive with BitLocker (for example, <drive> could be 'C:').\n";
     }
@@ -5563,6 +5638,9 @@ sub vm_start_nolock {
     }
 
     PVE::GuestHelpers::exec_hookscript($conf, $vmid, 'pre-start', 1);
+
+    # VPP bridges require shared memory (hugepages) for vhost-user to work
+
 
     my $forcemachine = $params->{forcemachine};
     my $forcecpu = $params->{forcecpu};
@@ -5756,6 +5834,7 @@ sub vm_start_nolock {
                 }
             }
 
+            vpp_connect_vhost_nets($conf, $vmid);
             my $exitcode = run_command($cmd, %run_params);
             eval { PVE::QemuServer::Virtiofs::close_sockets(@$virtiofs_sockets); };
             log_warn("closing virtiofs sockets failed - $@") if $@;
@@ -7246,7 +7325,7 @@ sub pbs_live_restore {
         $live_restore_backing->{$confname} = { name => $pbs_name };
 
         # add blockdev information
-        my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf);
+        my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf, undef, $conf->{arch});
         my $machine_version = PVE::QemuServer::Machine::extract_version(
             $machine_type,
             PVE::QemuServer::Helpers::kvm_user_version(),
@@ -7297,7 +7376,9 @@ sub pbs_live_restore {
         }
 
         mon_cmd($vmid, 'cont');
-        PVE::QemuServer::BlockJob::monitor($vmid, undef, $jobs, 'auto', 0, 'stream');
+        PVE::QemuServer::BlockJob::qemu_drive_mirror_monitor(
+            $vmid, undef, $jobs, 'auto', 0, 'stream',
+        );
 
         print "restore-drive jobs finished successfully, removing all tracking block devices"
             . " to disconnect from Proxmox Backup Server\n";
@@ -7353,7 +7434,7 @@ sub live_import_from_files {
 
         $live_restore_backing->{$dev} = { name => "drive-$dev-restore" };
 
-        my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf);
+        my $machine_type = PVE::QemuServer::Machine::get_vm_machine($conf, undef, $conf->{arch});
         my $machine_version = PVE::QemuServer::Machine::extract_version(
             $machine_type,
             PVE::QemuServer::Helpers::kvm_user_version(),
@@ -7416,7 +7497,9 @@ sub live_import_from_files {
         }
 
         mon_cmd($vmid, 'cont');
-        PVE::QemuServer::BlockJob::monitor($vmid, undef, $jobs, 'auto', 0, 'stream');
+        PVE::QemuServer::BlockJob::qemu_drive_mirror_monitor(
+            $vmid, undef, $jobs, 'auto', 0, 'stream',
+        );
 
         print "restore-drive jobs finished successfully, removing all tracking block devices\n";
 
@@ -7924,7 +8007,9 @@ sub clone_disk {
             # if this is the case, we have to complete any block-jobs still there from
             # previous drive-mirrors
             if (($completion && $completion eq 'complete') && (scalar(keys %$jobs) > 0)) {
-                PVE::QemuServer::BlockJob::monitor($vmid, $newvmid, $jobs, $completion, $qga);
+                PVE::QemuServer::BlockJob::qemu_drive_mirror_monitor(
+                    $vmid, $newvmid, $jobs, $completion, $qga,
+                );
             }
             goto no_data_clone;
         }
