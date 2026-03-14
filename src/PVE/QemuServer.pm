@@ -1351,7 +1351,8 @@ sub print_netdevice_full {
     }
 
     if (min_version($machine_version, 7, 1) && $net->{model} eq 'virtio') {
-        $tmpstr .= ",rx_queue_size=1024,tx_queue_size=256";
+        my $tx_queue_size = ($net->{bridge} && $net->{bridge} =~ /^vppbr\d+$/) ? 1024 : 256;
+        $tmpstr .= ",rx_queue_size=1024,tx_queue_size=$tx_queue_size";
     }
 
     $tmpstr .= ",bootindex=$net->{bootindex}" if $net->{bootindex};
@@ -5215,6 +5216,39 @@ sub vpp_connect_vhost_nets {
     }
 }
 
+sub vpp_cleanup_vhost_nets {
+    my ($conf, $vmid) = @_;
+
+    return if !-x '/usr/bin/vppctl';
+
+    foreach my $opt (keys %$conf) {
+        next if $opt !~ m/^net\d+$/;
+        my $net = PVE::QemuServer::Network::parse_net($conf->{$opt});
+        next if !$net || !$net->{bridge} || $net->{bridge} !~ /^vppbr\d+$/;
+
+        my $socket = "/var/run/vpp/qemu-${vmid}-${opt}.sock";
+
+        eval {
+            my $ifaces = '';
+            PVE::Tools::run_command(
+                ['/usr/bin/vppctl', 'show', 'vhost-user'],
+                outfunc => sub { $ifaces .= $_[0] . "\n"; },
+                timeout => 5,
+            );
+            while ($ifaces =~ /^Interface:\s+(\S+).*socket filename\s+\Q$socket\E/ms) {
+                my $iface = $1;
+                PVE::Tools::run_command(
+                    ['/usr/bin/vppctl', 'delete', 'vhost-user', $iface],
+                    timeout => 5,
+                );
+                print "VPP: deleted vhost-user interface $iface for $opt\n";
+                last;
+            }
+        };
+        warn "VPP vhost-user cleanup failed for $opt: $@" if $@;
+    }
+}
+
 sub vmconfig_update_agent {
     my ($conf, $opt, $value) = @_;
 
@@ -6232,6 +6266,8 @@ sub vm_stop_cleanup {
         }
 
         cleanup_pci_devices($vmid, $conf);
+
+        vpp_cleanup_vhost_nets($conf, $vmid);
 
         vmconfig_apply_pending($vmid, $conf, $storecfg) if $apply_pending_changes;
     };
